@@ -46,8 +46,9 @@ dm = LocalDataManager(None)
 cfg = load_config_data("./agent_motion_config.yaml")
 print(cfg)
 print(type(dm))
-log_dir = '../input/resnet_example.pth'
-
+# log_dir = '../input/resnet_example.pth'
+log_dir = '../input/resnet_pre_test.pth'
+resnet_pre = '../input/resnet_pretrain_dict.pth'
 # ## Model
 # 
 # Our baseline is a simple `resnet50` pretrained on `imagenet`. We must replace the input and the final layer to address our requirements.
@@ -57,7 +58,7 @@ log_dir = '../input/resnet_example.pth'
 
 def build_model(cfg: Dict) -> torch.nn.Module:
     # load pre-trained Conv2D model
-    model = resnet50(pretrained=True)
+    model = resnet50(pretrained=False)
 
     # change input channels number to match the rasterizer's output
     num_history_channels = (cfg["model_params"]["history_num_frames"] + 1) * 2
@@ -121,6 +122,10 @@ print(type(train_dataloader))
 # ==== INIT MODEL
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = build_model(cfg).to(device)
+if not cfg["train_params"]["load_the_state"]:
+    checkpoint_res_pretrain = torch.load(resnet_pre)
+    model.load_state_dict(checkpoint_res_pretrain['resnet_pretrained_model'])
+    print("resnet预训练加载成功")
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 criterion = nn.MSELoss(reduction="none")
 

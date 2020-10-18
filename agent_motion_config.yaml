@@ -49,13 +49,13 @@ train_data_loader:
   key: "scenes/sample.zarr"
   batch_size: 12
   shuffle: True
-  num_workers: 0
+  num_workers: 20
 
 val_data_loader:
   key: "scenes/sample.zarr"
   batch_size: 12
   shuffle: False
-  num_workers: 0
+  num_workers: 20
 
 ###################
 ## Train params
@@ -63,4 +63,4 @@ train_params:
   checkpoint_every_n_steps: 10000
   max_num_steps: 5
   eval_every_n_steps: 10000
-  load_the_state: True
+  load_the_state: False
