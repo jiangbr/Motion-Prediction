@@ -46,21 +46,23 @@ raster_params:
 ###################
 ## Data loader options
 train_data_loader:
-  key: "scenes/sample.zarr"
-  batch_size: 12
-  shuffle: True
-  num_workers: 20
+  key: "scenes/train.zarr"
+  batch_size: 10
+  shuffle: False
+  num_workers: 8
 
 val_data_loader:
-  key: "scenes/sample.zarr"
-  batch_size: 12
+  key: "scenes/test.zarr"
+  batch_size: 20
   shuffle: False
-  num_workers: 20
+  num_workers: 8
+  mask: "/scenes/mask.npz"
 
 ###################
 ## Train params
 train_params:
-  checkpoint_every_n_steps: 10000
-  max_num_steps: 5
+  checkpoint_every_n_steps: 4000
+  max_num_epochs: 4
   eval_every_n_steps: 10000
   load_the_state: False
+  model_num: 0
