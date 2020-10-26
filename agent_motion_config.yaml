@@ -47,7 +47,7 @@ raster_params:
 ## Data loader options
 train_data_loader:
   key: "scenes/train.zarr"
-  batch_size: 10
+  batch_size: 20
   shuffle: False
   num_workers: 8
 
