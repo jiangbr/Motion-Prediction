@@ -151,28 +151,71 @@ def train(gpu, args):
 
 
 # Evaluation
-def evaluate():
-    model_path = log_dir + 'resnet_{}.pth'.format(cfg['train_params']['model_num'])
-    checkpoint = torch.load(model_path)
-    model.load_state_dict(checkpoint['model'])
-    print("加载成功")
-    # ===== GENERATE AND LOAD CHOPPED DATASET
-    eval_cfg = cfg['val_data_loader']
+def test(gpu, args):
+    print('gpu{}: Begin to predict'.format(gpu))
+    # distributed training initialization
+    dist.init_process_group(
+        backend='nccl',
+        init_method='tcp://127.0.0.1:12121',
+        world_size=args.world_size,
+        rank=gpu
+    )
+    torch.manual_seed(0)
+
+    # INIT MODEL
+    model = build_model(cfg)
+    torch.cuda.set_device(gpu)
+    model.cuda(gpu)
+    print("gpu{}: Finish constructing model".format(gpu))
+    criterion = nn.MSELoss(reduction="none")
+
+    # Load the test Data
+    test_cfg = cfg['test_data_loader']
     # 获取mask
-    mask_path = os.environ["L5KIT_DATA_FOLDER"] + eval_cfg["mask"]
+    mask_path = os.environ["L5KIT_DATA_FOLDER"] + test_cfg["mask"]
     # 导入mask
     mask = np.load(mask_path)["arr_0"]
     # 生成网格
     rasterizer = build_rasterizer(cfg, dm)
     # 获取包含训练数据集的实例，内部包含agents、frames和scenes
-    test_zarr = ChunkedDataset(dm.require(eval_cfg["key"])).open()
+    test_zarr = ChunkedDataset(dm.require(test_cfg["key"])).open()
     # 获取数据集内的特定内容
     agent_dataset = AgentDataset(cfg, test_zarr, rasterizer)
     # 加入mask，仅对mask指出的71122个agent进行运动预测，这些agent均只有前100帧而没有未来的50帧
-    mask_dataset = AgentDataset(cfg, test_zarr, rasterizer, agents_mask=mask)
+    test_dataset = AgentDataset(cfg, test_zarr, rasterizer, agents_mask=mask)
 
-    eval_dataloader = DataLoader(mask_dataset, shuffle=eval_cfg["shuffle"], batch_size=eval_cfg["batch_size"],
-                                 num_workers=eval_cfg["num_workers"])
+    # wrap the dataset
+    test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=args.world_size,
+                                                                    rank=gpu, shuffle=test_cfg["shuffle"])
+    test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=test_cfg["batch_size"],
+                                  num_workers=test_cfg["num_workers"], pin_memory=True, sampler=test_sampler)
+
+    # wrap the model
+    model =nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+
+    # load trained model
+    model_path = log_dir + 'resnet_{}.pth'.format(cfg['test_params']['model_num'])
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model'])
+    print("test所用模型加载成功")
+
+    # # ===== GENERATE AND LOAD CHOPPED DATASET
+    # eval_cfg = cfg['val_data_loader']
+    # # 获取mask
+    # mask_path = os.environ["L5KIT_DATA_FOLDER"] + eval_cfg["mask"]
+    # # 导入mask
+    # mask = np.load(mask_path)["arr_0"]
+    # # 生成网格
+    # rasterizer = build_rasterizer(cfg, dm)
+    # # 获取包含训练数据集的实例，内部包含agents、frames和scenes
+    # test_zarr = ChunkedDataset(dm.require(eval_cfg["key"])).open()
+    # # 获取数据集内的特定内容
+    # agent_dataset = AgentDataset(cfg, test_zarr, rasterizer)
+    # # 加入mask，仅对mask指出的71122个agent进行运动预测，这些agent均只有前100帧而没有未来的50帧
+    # mask_dataset = AgentDataset(cfg, test_zarr, rasterizer, agents_mask=mask)
+    #
+    # eval_dataloader = DataLoader(mask_dataset, shuffle=eval_cfg["shuffle"], batch_size=eval_cfg["batch_size"],
+    #                              num_workers=eval_cfg["num_workers"])
 
     # EVAL LOOP
     model.eval()
@@ -183,9 +226,9 @@ def evaluate():
     timestamps = []
 
     agent_ids = []
-    progress_bar = tqdm(eval_dataloader)
+    progress_bar = tqdm(test_dataloader)
     for data in progress_bar:
-        _, ouputs = forward(data, model, device, criterion)
+        _, ouputs = forward(data, model, gpu, criterion)
         future_coords_offsets_pd.append(ouputs.cpu().numpy().copy())
         timestamps.append(data["timestamp"].numpy().copy())
         agent_ids.append(data["track_id"].numpy().copy())
@@ -213,7 +256,7 @@ def main():
     if not cfg["train_params"]["load_the_state"]:
         mp.spawn(train, nprocs=args.gpus, args=(args,))
     else:
-        mp.spawn(evaluate, nprocs=args.gpus, args=(args,))
+        mp.spawn(test, nprocs=args.gpus, args=(args,))
 
 
 if __name__ == '__main__':
