@@ -100,7 +100,8 @@ def train(gpu, args):
     print('gpu{}: Finish loading dataset'.format(gpu))
 
     # wrap the dataset
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=args.world_size, rank=gpu, shuffle=train_cfg["shuffle"])
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=args.world_size,
+                                                                    rank=gpu, shuffle=train_cfg["shuffle"])
     train_dataloader = DataLoader(train_dataset, shuffle=False, batch_size=train_cfg["batch_size"],
                                   num_workers=0, pin_memory=True, sampler=train_sampler)
 
@@ -179,19 +180,17 @@ def test(gpu, args):
     rasterizer = build_rasterizer(cfg, dm)
     # 获取包含训练数据集的实例，内部包含agents、frames和scenes
     test_zarr = ChunkedDataset(dm.require(test_cfg["key"])).open()
-    # 获取数据集内的特定内容
-    agent_dataset = AgentDataset(cfg, test_zarr, rasterizer)
     # 加入mask，仅对mask指出的71122个agent进行运动预测，这些agent均只有前100帧而没有未来的50帧
     test_dataset = AgentDataset(cfg, test_zarr, rasterizer, agents_mask=mask)
 
     # wrap the dataset
     test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=args.world_size,
-                                                                    rank=gpu, shuffle=test_cfg["shuffle"])
+                                                                   rank=gpu, shuffle=test_cfg["shuffle"])
     test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=test_cfg["batch_size"],
-                                  num_workers=test_cfg["num_workers"], pin_memory=True, sampler=test_sampler)
+                                 num_workers=test_cfg["num_workers"], pin_memory=True, sampler=test_sampler)
 
     # wrap the model
-    model =nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     # load trained model
     model_path = log_dir + 'resnet_{}.pth'.format(cfg['test_params']['model_num'])
@@ -233,14 +232,13 @@ def test(gpu, args):
         timestamps.append(data["timestamp"].numpy().copy())
         agent_ids.append(data["track_id"].numpy().copy())
 
-
     # Save results
     pred_path = "./pred.csv"
     write_pred_csv(pred_path,
                    timestamps=np.concatenate(timestamps),
                    track_ids=np.concatenate(agent_ids),
                    coords=np.concatenate(future_coords_offsets_pd),
-                  )
+                   )
 
 
 def main():
