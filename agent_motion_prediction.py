@@ -22,6 +22,20 @@ from l5kit.dataset import AgentDataset
 from l5kit.rasterization import build_rasterizer
 from l5kit.evaluation import write_pred_csv
 
+from l5kit.configs import load_config_data
+from l5kit.data import LocalDataManager, ChunkedDataset
+from l5kit.dataset import AgentDataset, EgoDataset
+from l5kit.rasterization import build_rasterizer
+from l5kit.evaluation import write_pred_csv, compute_metrics_csv, read_gt_csv, create_chopped_dataset
+from l5kit.evaluation.chop_dataset import MIN_FUTURE_STEPS
+from l5kit.evaluation.metrics import neg_multi_log_likelihood, time_displace
+from l5kit.geometry import transform_points
+from l5kit.visualization import PREDICTED_POINTS_COLOR, TARGET_POINTS_COLOR, draw_trajectory
+from prettytable import PrettyTable
+from pathlib import Path
+
+import os
+
 from apex.parallel import DistributedDataParallel as DDP
 from apex import amp
 
@@ -69,6 +83,8 @@ def forward(data_, model_, device_, criterion_):
     loss_ = loss_ * target_availabilities
     loss_ = loss_.mean()
     return loss_, outputs
+
+
 
 
 # Training
@@ -150,8 +166,104 @@ def train(gpu, args):
                 torch.save(state, log_dir + 'resnet_{}_{}.pth'.format(epoch, index))
     print("gpu{}: Finish training")
 
+# evaluation
+def eval_dataset():
+    num_frames_to_chop = 100
+    eval_cfg = cfg["val_data_loader"]
+    print(eval_cfg)
+    print("开始加载eval数据")
+    eval_base_path = create_chopped_dataset(dm.require(eval_cfg["key"]),
+                                            cfg["raster_params"]["filter_agents_threshold"],
+                                            num_frames_to_chop, cfg["model_params"]["future_num_frames"],
+                                            MIN_FUTURE_STEPS)
 
-# Evaluation
+
+def eval(gpu, args):
+    print('gpu{}: Begin to evaluate'.format(gpu))
+    # distributed training initialization
+    dist.init_process_group(
+        backend='nccl',
+        init_method='tcp://127.0.0.1:12121',
+        world_size=args.world_size,
+        rank=gpu
+    )
+    torch.manual_seed(0)
+
+    # INIT MODEL
+    model = build_model(cfg)
+    torch.cuda.set_device(gpu)
+    model.cuda(gpu)
+    print("gpu{}: Finish constructing model".format(gpu))
+    criterion = nn.MSELoss(reduction="none")
+
+    # wrap the model
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+
+    # load trained model
+    model_path = log_dir + 'resnet_1_{}.pth'.format(cfg['val_params']['model_num'])
+    print(model_path)
+    model.load_state_dict(torch.load(model_path, map_location={'cuda:%d' % 0: 'cuda:%d' % gpu})['model'])
+    print("gpu{}: Finish loading model".format(gpu))
+    dist.barrier()
+
+    num_frames_to_chop = 100
+    eval_cfg = cfg["val_data_loader"]
+    print(eval_cfg)
+    print("开始加载eval数据")
+    # eval_base_path = create_chopped_dataset(dm.require(eval_cfg["key"]),
+    #                                         cfg["raster_params"]["filter_agents_threshold"],
+    #                                         num_frames_to_chop, cfg["model_params"]["future_num_frames"],
+    #                                         MIN_FUTURE_STEPS)
+    eval_base_path = os.environ["L5KIT_DATA_FOLDER"] + "/scenes/validate_chopped_100"
+    # eval_zarr_path = str(Path(eval_base_path) / Path(dm.require(eval_cfg["key"])).name)
+    eval_zarr_path = str(Path(eval_base_path) / "validate.zarr")
+    eval_mask_path = str(Path(eval_base_path) / "mask.npz")
+    eval_gt_path = str(Path(eval_base_path) / "gt.csv")
+
+    eval_zarr = ChunkedDataset(eval_zarr_path).open()
+    eval_mask = np.load(eval_mask_path)["arr_0"]
+    # 生成网格
+    rasterizer = build_rasterizer(cfg, dm)
+    # ===== INIT DATASET AND LOAD MASK
+    eval_dataset = AgentDataset(cfg, eval_zarr, rasterizer, agents_mask=eval_mask)
+    # wrap the dataset
+    eval_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, num_replicas=args.world_size,
+                                                                   rank=gpu, shuffle=eval_cfg["shuffle"])
+    eval_dataloader = DataLoader(eval_dataset, shuffle=eval_cfg["shuffle"], batch_size=eval_cfg["batch_size"],
+                                 num_workers=0, sampler=eval_sampler)
+    model.eval()
+    torch.set_grad_enabled(False)
+
+    # store information for evaluation
+    future_coords_offsets_pd = []
+    timestamps = []
+    agent_ids = []
+    i = 0
+    print("len", len(eval_dataloader))
+    progress_bar = tqdm(eval_dataloader)
+    for data in progress_bar:
+        if i > 99:
+            break
+        _, ouputs = forward(data, model, gpu, criterion)
+        future_coords_offsets_pd.append(ouputs.cpu().numpy().copy())
+        timestamps.append(data["timestamp"].numpy().copy())
+        agent_ids.append(data["track_id"].numpy().copy())
+        i = i+1
+    pred_path = "./evaluation_pred.csv"
+
+    write_pred_csv(pred_path,
+                   timestamps=np.concatenate(timestamps),
+                   track_ids=np.concatenate(agent_ids),
+                   coords=np.concatenate(future_coords_offsets_pd),
+                   )
+
+    metrics = compute_metrics_csv(eval_gt_path, pred_path, [neg_multi_log_likelihood])
+    for metric_name, metric_mean in metrics.items():
+        print(metric_name, metric_mean)
+        with open('likelihood', 'a') as file_handle:
+            file_handle.write("{}:{}\n".format(metric_name, metric_mean))
+
+# Test
 def test(gpu, args):
     print('gpu{}: Begin to predict'.format(gpu))
     # distributed training initialization
@@ -187,16 +299,21 @@ def test(gpu, args):
     test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=args.world_size,
                                                                    rank=gpu, shuffle=test_cfg["shuffle"])
     test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=test_cfg["batch_size"],
-                                 num_workers=test_cfg["num_workers"], pin_memory=True, sampler=test_sampler)
-
+                                 num_workers=0, pin_memory=True, sampler=test_sampler)
+    print(len(test_dataloader))
     # wrap the model
     model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     # load trained model
-    model_path = log_dir + 'resnet_{}.pth'.format(cfg['test_params']['model_num'])
-    checkpoint = torch.load(model_path)
-    model.load_state_dict(checkpoint['model'])
-    print("test所用模型加载成功")
+    model_path = log_dir + 'resnet_1_{}.pth'.format(cfg['test_params']['model_num'])
+    # checkpoint = torch.load(model_path)
+    # model.load_state_dict(checkpoint['model'])
+    # print("test所用模型加载成功")
+    #
+    # model_path = log_dir + 'resnet_{}.pth'.format(cfg['train_params']['model_num'])
+    model.load_state_dict(torch.load(model_path, map_location={'cuda:%d' % 0: 'cuda:%d' % gpu})['model'])
+    print("gpu{}: Finish loading model".format(gpu))
+    dist.barrier()
 
     # # ===== GENERATE AND LOAD CHOPPED DATASET
     # eval_cfg = cfg['val_data_loader']
@@ -233,7 +350,7 @@ def test(gpu, args):
         agent_ids.append(data["track_id"].numpy().copy())
 
     # Save results
-    pred_path = "./pred.csv"
+    pred_path = "./pred_{}_gpu{}.csv".format(cfg['test_params']['model_num'], gpu)
     write_pred_csv(pred_path,
                    timestamps=np.concatenate(timestamps),
                    track_ids=np.concatenate(agent_ids),
@@ -244,17 +361,35 @@ def test(gpu, args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-n', '--nodes', default=1, type=int, metavar='N')
-    parser.add_argument('-g', '--gpus', default=4, type=int,
+    parser.add_argument('-g', '--gpus', default=8, type=int,
                         help='number of gpus per node')
     parser.add_argument('-nr', '--nr', default=0, type=int,
                         help='ranking within the nodes')
     args = parser.parse_args()
 
     args.world_size = args.gpus * args.nodes
+    # eval_dataset()
     if not cfg["train_params"]["load_the_state"]:
         mp.spawn(train, nprocs=args.gpus, args=(args,))
-    else:
+    if cfg["test_params"]["load_the_state"]:
+        args.gpus = 1
+        args.world_size = 1
         mp.spawn(test, nprocs=args.gpus, args=(args,))
+    if cfg["val_params"]["load_the_state"]:
+        args.gpus = 1
+        args.world_size = 1
+        mp.spawn(eval, nprocs=args.gpus, args=(args,))
+    eval_base_path = os.environ["L5KIT_DATA_FOLDER"] + "/scenes/validate_chopped_100"
+    eval_gt_path = str(Path(eval_base_path) / "gd2000new.csv")
+    pred_path = "./evaluation_pred.csv"
+    metrics = compute_metrics_csv(eval_gt_path, pred_path, [neg_multi_log_likelihood])
+    for metric_name, metric_mean in metrics.items():
+        print(metric_name, metric_mean)
+        with open('likelihood', 'a') as file_handle:
+            file_handle.write("{}:{}\n".format(metric_name, metric_mean))
+
+
+
 
 
 if __name__ == '__main__':

@@ -115,42 +115,6 @@ def logsumexp(inputs: torch.Tensor, dim: Optional[int] = None, keepdim: Optional
     return outputs
 
 
-def nll_loss_test_multimodes(pred: List[torch.Tensor], data: torch.Tensor, mask: torch.Tensor, modes_pred: torch.Tensor,
-                             y_mean: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """NLL loss multimodes for test time."""
-    modes = len(pred)
-    nSteps, batch_sz, dim = pred[0].shape
-    total = torch.zeros(mask.shape[0], mask.shape[1], modes).to(y_mean.device)
-    count = 0
-    for k in range(modes):
-        wts = modes_pred[:, k]
-        wts = wts.repeat(nSteps, 1)
-        y_pred = pred[k]
-        if y_mean is not None:
-            x_pred_mean = y_pred[:, :, 0] + y_mean[:, 0].view(-1, 1)
-            y_pred_mean = y_pred[:, :, 1] + y_mean[:, 1].view(-1, 1)
-        else:
-            x_pred_mean = y_pred[:, :, 0]
-            y_pred_mean = y_pred[:, :, 1]
-        x_sigma = y_pred[:, :, 2]
-        y_sigma = y_pred[:, :, 3]
-        rho = y_pred[:, :, 4]
-        ohr = torch.pow(1 - torch.pow(rho, 2), -0.5)  # type: ignore
-        x = data[:, :, 0]
-        y = data[:, :, 1]
-        out = -(torch.pow(ohr, 2) * (
-                torch.pow(x_sigma, 2) * torch.pow(x - x_pred_mean, 2) + torch.pow(y_sigma, 2) * torch.pow(y - y_pred_mean, 2)
-                - 2 * rho * torch.pow(x_sigma, 1) * torch.pow(y_sigma, 1) * (x - x_pred_mean) * (
-                        y - y_pred_mean)) - torch.log(x_sigma * y_sigma * ohr))
-        total[:, :, count] = out + torch.log(wts)
-        count += 1
-    total = -logsumexp(total, dim=2)
-    total = total * mask[:, :, 0]
-    lossVal = torch.sum(total, dim=1)
-    counts = torch.sum(mask[:, :, 0], dim=1)
-    return lossVal, counts
-
-
 def nll_loss_multimodes(pred: List[torch.Tensor], data: torch.Tensor, mask: torch.Tensor, modes_pred: torch.Tensor,
                         noise: Optional[float] = 0.0) -> float:
     """NLL loss multimodes for training.
@@ -159,29 +123,7 @@ def nll_loss_multimodes(pred: List[torch.Tensor], data: torch.Tensor, mask: torc
     data is ground truth    
     noise is optional
   """
-    modes = len(pred)
-    nSteps, batch_sz, dim = pred[0].shape
-    log_lik = np.zeros((batch_sz, modes))
-    with torch.no_grad():
-        for kk in range(modes):
-            nll = nll_loss_per_sample(pred[kk], data, mask)
-            log_lik[:, kk] = -nll.cpu().numpy()
 
-    priors = modes_pred.detach().cpu().numpy()
-
-    log_posterior_unnorm = log_lik + np.log(priors).reshape((-1, modes))  # [TotalObjs, net.modes]
-    log_posterior_unnorm += np.random.randn(*log_posterior_unnorm.shape) * noise
-    log_posterior = log_posterior_unnorm - special.logsumexp(log_posterior_unnorm, axis=1).reshape((batch_sz, 1))
-    post_pr = np.exp(log_posterior)  # [TotalObjs, net.modes]
-
-    post_pr = torch.tensor(post_pr).float().to(data.device)
-    loss = 0.0
-    for kk in range(modes):
-        nll_k = nll_loss_per_sample(pred[kk], data, mask) * post_pr[:, kk]
-        loss += nll_k.sum() / float(batch_sz)
-
-    kl_loss = torch.nn.KLDivLoss(reduction='batchmean')  # type: ignore
-    loss += kl_loss(torch.log(modes_pred), post_pr)
     return loss
 
 

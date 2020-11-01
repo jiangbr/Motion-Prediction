@@ -158,7 +158,7 @@ class mfpNet(nn.Module, ABC):
             torch.nn.Linear(self.sec_hidden_dim, self.st_enc_pos_size)
         )
 
-    def rbf_state_enc_get_attens(self, nbrs_enc: torch.Tensor, ref_pos: torch.Tensor, nbrs_info_this: List) -> List[torch.Tensor]:
+    def rbf_state_enc_get_attens(self, nbrs_enc: torch.Tensor, ref_pos: torch.Tensor, nbrs_pos: torch.Tensor, nbrs_info_this: List) -> List[torch.Tensor]:
         """Computing the attention over other agents.
         Args:
             nbrs_enc is hidden states of every agents
@@ -176,7 +176,7 @@ class mfpNet(nn.Module, ABC):
             counter = 0
             for n in range(len(nbrs_info_this)):
                 for nbr in nbrs_info_this[n]:
-                    pos_enc[counter, :] = ref_pos[nbr[0], :] - ref_pos[n, :]
+                    pos_enc[counter, :] = nbrs_pos[nbr[0], :] - ref_pos[n, :]
                     counter += 1
             # size of Key is (nbrs_enc.shape[0], 8), every agents have corresponding keys
             Key = self.sec_key_net(torch.cat((nbrs_enc, pos_enc), dim=1))
@@ -323,7 +323,7 @@ class mfpNet(nn.Module, ABC):
             # which means each agent is related to a set of neighbors, the index is the value of nbr_info[0]
             # and each neighbor is also a agent in agent_enc and ref_pos
             # attens is a list with num_agents items, each item means num_key * num_cor_nbrs
-            attens = self.rbf_state_enc_get_attens(nbrs_enc, ref_pos, nbrs_info[0])
+            attens = self.rbf_state_enc_get_attens(nbrs_enc, ref_pos, nbrs_ref_pos, nbrs_info[0])
             # nbr_atten_enc is [num_agents, 80] which combines information of all the neighbors
             nbr_atten_enc = self.rbf_state_enc_hist_fwd(attens, nbrs_enc, nbrs_info[0])
 

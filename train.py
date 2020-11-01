@@ -3,20 +3,295 @@
 # Copyright (C) 2019-2020 Apple Inc. All Rights Reserved.
 #
 
-import time
-from attrdict import AttrDict
 import gin
-from dataset import *
+import time
+import numpy as np
+from typing import *
+from attrdict import AttrDict
+from tqdm import tqdm
+
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+import torch.distributed as dist
+
+from l5kit.configs import load_config_data
+from l5kit.data import LocalDataManager, ChunkedDataset
+from l5kit.rasterization import build_rasterizer
+
 from model_mfp import mfpNet
 from my_utils import *
+from MyDataset import MyDataset
 
-np.set_printoptions(suppress=True)
+
+def setup_logger(root_dir: str, rank: int) -> Tuple[Any, Any]:
+    """Setup the data logger for logging"""
+    import time
+    import datetime
+    import os
+
+    timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y.%m.%d_%H.%M.%S')
+    logging_dir = root_dir + "%s/" % timestamp
+    if not os.path.isdir(logging_dir) and rank == 0:
+        os.makedirs(logging_dir)
+        os.makedirs(logging_dir + '/checkpoints')
+        print("! gpu{}".format(rank) + logging_dir + " CREATED!")
+    dist.barrier()
+
+    logger_file = open(logging_dir + '/logging_{}.log'.format(rank), 'w')
+    return logger_file, logging_dir
 
 
-def eval_(metric: str, net: torch.nn.Module, params: AttrDict, data_loader: DataLoader, bStepByStep: bool,
-          use_forcing: int, y_mean: torch.Tensor, num_batches: int, dataset_name: str) -> torch.Tensor:
+@gin.configurable
+class Params(object):
+    def __init__(self, log: bool = False,  # save checkpoints?
+                 modes: int = 3,  # how many latent modes
+                 encoder_size: int = 16,  # encoder latent layer size
+                 decoder_size: int = 16,  # decoder latent layer size
+                 subsampling: int = 2,  # factor subsample in time
+                 hist_len_orig_hz: int = 30,  # number of original history samples
+                 fut_len_orig_hz: int = 50,  # number of original future samples
+                 dyn_embedding_size: int = 32,  # dynamic embedding size
+                 input_embedding_size: int = 32,  # input embedding size
+                 dec_nbr_enc_size: int = 8,  # decoder neighbors encode size
+                 nbr_atten_embedding_size: int = 80,  # neighborhood attention embedding size
+                 seed: int = 1234,
+                 remove_y_mean: bool = False,  # normalize by remove mean of the future trajectory
+                 use_gru: bool = True,  # GRUs instead of LSTMs
+                 bi_direc: bool = False,  # bidrectional
+                 self_norm: bool = False,  # normalize with respect to the current time
+                 data_aug: bool = False,  # data augment
+                 use_context: bool = False,  # use contextual image as additional input
+                 nll: bool = True,  # negative log-likelihood loss
+                 use_forcing: int = 0,  # teacher forcing
+                 iter_per_err: int = 100,  # iterations to display errors
+                 iter_per_eval: int = 1000,  # iterations to eval on validation set
+                 pre_train_num_updates: int = 200000,  # how many iterations for pretraining
+                 updates_div_by_10: int = 100000,  # at what iteration to divide the learning rate by 10.0
+                 nbr_search_depth: int = 10,  # how deep do we search for neighbors
+                 lr_init: float = 0.001,  # initial learning rate
+                 min_lr: float = 0.00005,  # minimal learning rate
+                 use_cuda: bool = True,
+                 iters_per_save: int = 1500,
+                 epoch: int = 10,
+                 env: str = '',
+                 l5kit: str = '') -> None:
+        # function locals() returns local dictionary
+        self.params = AttrDict(locals())
+
+    def __call__(self) -> Any:
+        return self.params
+
+
+class StampDataset(Dataset):
+    def __init__(self, my_dataset: MyDataset):
+        """The dataset is used to transform items of MyDataset into desired format"""
+        self.length = len(my_dataset)
+        # define item list and assign transform
+        self.dataset = my_dataset
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index: int) -> Tuple:
+        """Return corresponding item"""
+        data = self.dataset[index]
+        # define history trajectory
+        hist = np.expand_dims(data['My_agent_history_position'], 1)
+        # define future trajectory
+        fut = np.expand_dims(data['target_positions'], 1)
+        # define neighbor trajectory
+        nbrs = np.transpose(data['neighbor_agents_history_position'], (1, 0, 2))
+        # define mask
+        mask = np.ones((fut.shape[0], fut.shape[1], 1)).astype(np.uint8)
+        # define context
+        context = None
+        # define nbrs_info
+        neighbor_list = [[x] for x in range(nbrs.shape[1])]
+        nbrs_info = [{0: neighbor_list}]
+        # combine to be a tuple
+        item = (hist, nbrs, fut, mask, context, nbrs_info)
+
+        return item
+
+    @staticmethod
+    def collate_fn(samples: List[Any]) -> Tuple:
+        """Return desired format for DataLoader"""
+        hist, nbrs, fut, mask, context, nbrs_info = samples[0]
+        # transform to tensor
+        hist = torch.from_numpy(hist).float()
+        nbrs = torch.from_numpy(nbrs).float()
+        fut = torch.from_numpy(fut).float()
+        mask = torch.from_numpy(mask)
+        if context is not None:
+            context = torch.from_numpy(context)
+
+        return hist, nbrs, fut, mask, context, nbrs_info
+
+
+#####################################################################################################
+
+
+def train(rank: int, args: Any) -> None:
+    """Main training function"""
+
+    # distributed training initialization
+    gpu = args.list[rank]
+    dist.init_process_group(
+        backend='nccl',
+        init_method='tcp://127.0.0.1:12222',
+        world_size=args.gpus,
+        rank=rank
+    )
+    print('Begin training with GPU{}'.format(gpu))
+
+    # import config with gin
+    gin.parse_config_file(args.config)
+    params = Params()()
+
+    # assign random seed
+    torch.manual_seed(params.seed)
+    np.random.seed(params.seed)
+
+    # set env variable and get config
+    os.environ["L5KIT_DATA_FOLDER"] = params.env
+    dm = LocalDataManager(None)
+    cfg = load_config_data(params.l5kit)
+
+    # Load the dataset
+    train_cfg = cfg["train_data_loader"]
+    rasterizer = build_rasterizer(cfg, dm)
+    train_zarr = ChunkedDataset(dm.require(train_cfg["key"])).open()
+    my_dataset = MyDataset(cfg, train_zarr, rasterizer)
+
+    # wrap dataset with StampDataset
+    train_dataset = StampDataset(my_dataset)
+
+    # wrap the dataset
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=args.gpus,
+                                                                    rank=rank, shuffle=train_cfg["shuffle"])
+    train_data_loader = DataLoader(train_dataset, shuffle=False, batch_size=1, collate_fn=train_dataset.collate_fn,
+                                   num_workers=0, pin_memory=True, sampler=train_sampler)
+
+    # Initialize network
+    net = mfpNet(params)
+    torch.cuda.set_device(gpu)
+    net.cuda(gpu)
+
+    # wrap model
+    net = nn.parallel.DistributedDataParallel(net, device_ids=[gpu])
+
+    # define logging file
+    logger_file, logging_dir = None, None
+    if params.log:
+        logger_file, logging_dir = setup_logger("./checkpts/", rank)
+
+    train_loss: List = []
+
+    # For efficiency, we first pre-train w/o interactive rollouts
+    MODE = 'Pre'
+    num_updates = 0
+    optimizer = None
+
+    for epoch_num in range(params.epoch):
+        if MODE == 'EndPre':
+            MODE = 'Train'
+            print('Training with interactive rollouts.')
+            bStepByStep = True
+        else:
+            print('Pre-training without interactive rollouts.')
+            bStepByStep = False
+
+        # Average losses.
+        avg_tr_loss = []
+
+        # begin training
+        for data in train_data_loader:
+            # transform from Pre mode to EndPre mode
+            '''
+            if num_updates > params.pre_train_num_updates and MODE == 'Pre':
+                MODE = 'EndPre'
+                break
+            '''
+
+            # Determine learning rate
+            lr_fac = np.power(0.1, num_updates // params.updates_div_by_10)
+            lr = max(params.min_lr, params.lr_init * lr_fac)
+            if optimizer is None:
+                optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+            elif lr != optimizer.defaults['lr']:
+                optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+            # extract data from dataset
+            # hist is [seq_len, num_agents, 2]
+            # nbrs is [seq_len, num_nbrs, 2]
+            # fut is [fut_len, num_agents, 2]
+            # mask is [fut_len, num_agents, 1]
+            # context is [num_agents, 3, 96, 320]
+            # nbrs_info[0] is dictionary with {0: nbrs, 1:nbrs}
+            hist, nbrs, fut, mask, context, nbrs_info = data
+            hist = hist.cuda(gpu)
+            nbrs = nbrs.cuda(gpu)
+            fut = fut.cuda(gpu)
+            mask = mask.cuda(gpu)
+            if context is not None:
+                context = context.cuda(gpu)
+
+            # Forward pass.
+            fut_preds, modes_pred = net.module.forward_mfp(hist, nbrs, mask, context, nbrs_info, fut, bStepByStep)
+            if params.modes == 1:
+                l = nll_loss(fut_preds[0], fut, mask)
+            else:
+                l = nll_loss_multimodes(fut_preds, fut, mask, modes_pred)
+
+            # Backpropagation.
+            optimizer.zero_grad()
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 10)
+            optimizer.step()
+            num_updates += 1
+
+            avg_tr_loss.append(l.item())
+
+            # effective_batch_sz = float(hist.shape[1])
+            if num_updates % params.iter_per_err == params.iter_per_err - 1:
+                train_loss.append(np.mean(avg_tr_loss))
+                print("GPU{}: Epoch no:".format(rank), epoch_num, "update:", num_updates, "| Avg train loss:",
+                      format(np.mean(avg_tr_loss), '0.4f'), " learning_rate:%.5f" % lr)
+
+                if params.log:
+                    msg_str_ = ("Epoch no:", epoch_num, "update:", num_updates, "| Avg train loss:",
+                                format(np.mean(avg_tr_loss), '0.4f'), " learning_rate:%.5f" % lr)
+                    msg_str = str([str(ss) for ss in msg_str_])
+                    logger_file.write(msg_str + '\n')
+                    logger_file.flush()
+
+                avg_tr_loss = []
+                '''
+                if num_updates % params.iter_per_eval == params.iter_per_eval - 1:
+                    print("Starting eval")
+                    val_nll_err = evaluate('nll', net, params, val_data_loader, bStepByStep,
+                                           use_forcing=params.use_forcing, y_mean=y_mean,
+                                           num_batches=500, dataset_name='val_dl nll')
+
+                    if params.log:
+                        logger_file.write('val nll: ' + str(val_nll_err) + '\n')
+                        logger_file.flush()
+                '''
+
+            # Save weights.
+            if params.log and num_updates % params.iters_per_save == params.iters_per_save - 1 and rank == 0:
+                msg_str = '\nSaving state, update iter:%d %s' % (num_updates, logging_dir)
+                print(msg_str)
+                logger_file.write(msg_str)
+                logger_file.flush()
+                torch.save(net.state_dict(),
+                           logging_dir + '/checkpoints/ngsim_%06d' % num_updates + '.pth')  # type: ignore
+
+
+def evaluate(metric: str, net: torch.nn.Module, params: AttrDict, data_loader: DataLoader, bStepByStep: bool,
+             use_forcing: int, y_mean: torch.Tensor, num_batches: int, dataset_name: str) -> torch.Tensor:
     """Evaluation function for validation and test data.
-  
+
     Given a MFP network, data loader, evaluate either NLL or RMSE error.
     """
     print('eval ', dataset_name)
@@ -66,237 +341,3 @@ def eval_(metric: str, net: torch.nn.Module, params: AttrDict, data_loader: Data
         err = torch.pow(lossVals / counts, 0.5) * 0.3048
         print(err)  # Calculate RMSE and convert from feet to meters
     return err
-
-
-def get_mean(train_data_loader: DataLoader, batches: Optional[int] = 200) -> np.ndarray:
-    """Compute the means over some samples from the training data."""
-    yy = []
-    counters = None
-    for i, data in enumerate(train_data_loader):
-        if i > batches:  # type: ignore
-            break
-        hist, nbrs, _, fut, fut_mask, _, _ = data
-        target = fut.cpu().numpy()
-        valid = fut_mask.cpu().numpy().sum(axis=1)
-
-        if counters is None:
-            counters = np.zeros_like(valid)
-        counters += valid
-
-        isinvalid = (fut_mask == 0)
-        target[isinvalid] = 0
-        yy.append(target)
-
-    Y = np.concatenate(yy, axis=1)
-    y_mean = np.divide(np.sum(Y, axis=1), counters)
-    return y_mean
-
-
-def setup_logger(root_dir: str, SCENARIO_NAME: str) -> Tuple[Any, Any]:
-    """Setup the data logger for logging."""
-    import time
-    import datetime
-    import os
-
-    timestamp = datetime.datetime.fromtimestamp(time.time()).strftime('%Y.%m.%d_%H.%M.%S')
-    logging_dir = root_dir + "%s_%s/" % (SCENARIO_NAME, timestamp)
-    if not os.path.isdir(logging_dir):
-        os.makedirs(logging_dir)
-        os.makedirs(logging_dir + '/checkpoints')
-        print("! " + logging_dir + " CREATED!")
-
-    logger_file = open(logging_dir + '/log', 'w')
-    return logger_file, logging_dir
-
-
-################################################################################
-@gin.configurable
-class Params(object):
-    def __init__(self, log: bool = False,  # save checkpoints?
-                 modes: int = 2,  # how many latent modes
-                 use_cuda: bool = True,
-                 encoder_size: int = 16,  # encoder latent layer size
-                 decoder_size: int = 16,  # decoder latent layer size
-                 subsampling: int = 2,  # factor subsample in time
-                 hist_len_orig_hz: int = 30,  # number of original history samples
-                 fut_len_orig_hz: int = 50,  # number of original future samples
-                 dyn_embedding_size: int = 32,  # dynamic embedding size
-                 input_embedding_size: int = 32,  # input embedding size
-                 dec_nbr_enc_size: int = 8,  # decoder neighbors encode size
-                 nbr_atten_embedding_size: int = 80,  # neighborhood attention embedding size
-                 seed: int = 1234,
-                 remove_y_mean: bool = False,  # normalize by remove mean of the future trajectory
-                 use_gru: bool = True,  # GRUs instead of LSTMs
-                 bi_direc: bool = False,  # bidrectional
-                 self_norm: bool = False,  # normalize with respect to the current time
-                 data_aug: bool = False,  # data augment
-                 use_context: bool = False,  # use contextual image as additional input
-                 nll: bool = True,  # negative log-likelihood loss
-                 use_forcing: int = 0,  # teacher forcing
-                 iter_per_err: int = 100,  # iterations to display errors
-                 iter_per_eval: int = 1000,  # iterations to eval on validation set
-                 pre_train_num_updates: int = 200000,  # how many iterations for pretraining
-                 updates_div_by_10: int = 100000,  # at what iteration to divide the learning rate by 10.0
-                 nbr_search_depth: int = 10,  # how deep do we search for neighbors
-                 lr_init: float = 0.001,  # initial learning rate
-                 min_lr: float = 0.00005,  # minimal learning rate
-                 iters_per_save: int = 1500) -> None:
-        # function locals() returns local dictionary
-        self.params = AttrDict(locals())
-
-    def __call__(self) -> Any:
-        return self.params
-
-
-################################################################################
-
-def train(params: AttrDict) -> Any:
-    """Main training function."""
-    torch.manual_seed(params.seed)  # type: ignore
-    np.random.seed(params.seed)
-
-    ############################
-    batch_size = 1
-    # data_hz = 10
-    # ns_between_samples = (1.0 / data_hz) * 1e9
-    d_s = params.subsampling
-    t_h = params.hist_len_orig_hz
-    t_f = params.fut_len_orig_hz
-    NUM_WORKERS = 1
-
-    DATA_PATH = 'multiple_futures_prediction/'
-
-    # Loading the dataset.
-    train_set = NgsimDataset(DATA_PATH + 'ngsim_data/TrainSet.mat', t_h, t_f, d_s, params.encoder_size, params.use_gru,
-                             params.self_norm,
-                             params.data_aug, params.use_context, params.nbr_search_depth)
-    val_set = NgsimDataset(DATA_PATH + 'ngsim_data/ValSet.mat', t_h, t_f, d_s, params.encoder_size, params.use_gru,
-                           params.self_norm,
-                           params.data_aug, params.use_context, params.nbr_search_depth)
-    # test_set = NgsimDataset(DATA_PATH + 'ngsim_data/TestSet.mat', t_h, t_f, d_s, params.encoder_size, params.use_gru,
-    #                        params.self_norm,
-    #                        params.data_aug, params.use_context, params.nbr_search_depth)
-    train_data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS,
-                                   collate_fn=train_set.collate_fn, drop_last=True)  # type: ignore
-    val_data_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS,
-                                 collate_fn=val_set.collate_fn, drop_last=True)  # type: ignore
-    # test_data_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS,
-    #                                  collate_fn=test_set.collate_fn, drop_last=False)  # type: ignore
-
-    # Compute or load existing mean over future trajectories.
-    if os.path.exists(DATA_PATH + 'ngsim_data/y_mean.pkl'):
-        y_mean = pickle.load(open(DATA_PATH + 'ngsim_data/y_mean.pkl', 'rb'))
-    else:
-        y_mean = get_mean(train_data_loader)
-        pickle.dump(y_mean, open(DATA_PATH + 'ngsim_data/y_mean.pkl', 'wb'))
-
-    # Initialize network
-    net = mfpNet(params)
-    if params.use_cuda:
-        net = net.cuda()  # type: ignore
-
-    net.y_mean = y_mean
-    y_mean = torch.tensor(net.y_mean)
-
-    logger_file, logging_dir = None, None
-    if params.log:
-        logger_file, logging_dir = setup_logger(DATA_PATH + "./checkpts/", 'NGSIM')
-
-    train_loss: List = []
-    # val_loss: List = []
-
-    MODE = 'Pre'  # For efficiency, we first pre-train w/o interactive rollouts.
-    num_updates = 0
-    optimizer = None
-
-    for epoch_num in range(20):
-        if MODE == 'EndPre':
-            MODE = 'Train'
-            print('Training with interactive rollouts.')
-            bStepByStep = True
-        else:
-            print('Pre-training without interactive rollouts.')
-            bStepByStep = False
-
-            # Average losses.
-        avg_tr_loss = 0.
-        avg_tr_time = 0.
-        # loss_counter = 0.0
-
-        for i, data in enumerate(train_data_loader):
-            if num_updates > params.pre_train_num_updates and MODE == 'Pre':
-                MODE = 'EndPre'
-                break
-
-            lr_fac = np.power(0.1, num_updates // params.updates_div_by_10)
-            lr = max(params.min_lr, params.lr_init * lr_fac)
-            if optimizer is None:
-                optimizer = torch.optim.Adam(net.parameters(), lr=lr)  # type: ignore
-            elif lr != optimizer.defaults['lr']:
-                optimizer = torch.optim.Adam(net.parameters(), lr=lr)
-
-            st_time = time.time()
-            hist, nbrs, mask, fut, mask, context, nbrs_info = data
-
-            if params.remove_y_mean:
-                fut = fut - y_mean.unsqueeze(1)
-
-            if params.use_cuda:
-                hist = hist.cuda()
-                nbrs = nbrs.cuda()
-                mask = mask.cuda()
-                fut = fut.cuda()
-                mask = mask.cuda()
-                if context is not None:
-                    context = context.cuda()
-
-            # Forward pass.
-            fut_preds, modes_pred = net.forward_mfp(hist, nbrs, mask, context, nbrs_info, fut, bStepByStep)
-            if params.modes == 1:
-                l = nll_loss(fut_preds[0], fut, mask)
-            else:
-                l = nll_loss_multimodes(fut_preds, fut, mask, modes_pred)  # type: ignore
-
-            # Backpropagation.
-            optimizer.zero_grad()
-            l.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 10)  # type: ignore
-            optimizer.step()
-            num_updates += 1
-
-            batch_time = time.time() - st_time
-            avg_tr_loss += l.item()
-            avg_tr_time += batch_time
-
-            # effective_batch_sz = float(hist.shape[1])
-            if num_updates % params.iter_per_err == params.iter_per_err - 1:
-                print("Epoch no:", epoch_num, "update:", num_updates, "| Avg train loss:",
-                      format(avg_tr_loss / 100, '0.4f'), " learning_rate:%.5f" % lr)
-                train_loss.append(avg_tr_loss / 100)
-
-                if params.log:
-                    msg_str_ = ("Epoch no:", epoch_num, "update:", num_updates, "| Avg train loss:",
-                                format(avg_tr_loss / 100, '0.4f'), " learning_rate:%.5f" % lr)
-                    msg_str = str([str(ss) for ss in msg_str_])
-                    logger_file.write(msg_str + '\n')
-                    logger_file.flush()
-
-                avg_tr_loss = 0.
-                if num_updates % params.iter_per_eval == params.iter_per_eval - 1:
-                    print("Starting eval")
-                    val_nll_err = eval_('nll', net, params, val_data_loader, bStepByStep,
-                                        use_forcing=params.use_forcing, y_mean=y_mean,
-                                        num_batches=500, dataset_name='val_dl nll')
-
-                    if params.log:
-                        logger_file.write('val nll: ' + str(val_nll_err) + '\n')
-                        logger_file.flush()
-
-            # Save weights.
-            if params.log and num_updates % params.iters_per_save == params.iters_per_save - 1:
-                msg_str = '\nSaving state, update iter:%d %s' % (num_updates, logging_dir)
-                print(msg_str)
-                logger_file.write(msg_str)
-                logger_file.flush()
-                torch.save(net.state_dict(),
-                           logging_dir + '/checkpoints/ngsim_%06d' % num_updates + '.pth')  # type: ignore
