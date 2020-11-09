@@ -22,12 +22,12 @@ Params.self_norm                = True                      # Normalize predicti
 Params.data_aug                 = False                     # Add noise to data?
 Params.use_context              = False                     # use contextual bird's eye view map?
 Params.nll                      = True                      # Use negative Log-likelihood loss
-Params.use_forcing              = 1                         # 0: no forcing. 1: teacher-forcing. 2: classmates-forcing.
+Params.use_forcing              = 2                         # 0: no forcing. 1: teacher-forcing. 2: classmates-forcing.
 
 Params.iter_per_err             = 100
 Params.iter_per_eval            = 5000
 Params.iters_per_save           = 5000
-Params.training_mode_update     = 20000                     # switch training forcing
+Params.training_mode_update     = 10000                     # switch training forcing
 Params.pre_train_num_updates    = 50000
 Params.updates_div_by_10        = 50000
 Params.nbr_search_depth         = 10                        # depth of searching for finding 'neighbors' (only for NGSIM dataset)
