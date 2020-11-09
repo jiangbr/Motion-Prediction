@@ -176,8 +176,16 @@ def eval_dataset():
                                             cfg["raster_params"]["filter_agents_threshold"],
                                             num_frames_to_chop, cfg["model_params"]["future_num_frames"],
                                             MIN_FUTURE_STEPS)
-
-
+# "./evaluation_pred.csv""gd2000new.csv"
+def eval_csv(predcsv, evalcsv):
+    eval_base_path = os.environ["L5KIT_DATA_FOLDER"] + "/scenes/validate_chopped_100"
+    eval_gt_path = str(Path(eval_base_path) / evalcsv)
+    pred_path = predcsv
+    metrics = compute_metrics_csv(eval_gt_path, pred_path, [neg_multi_log_likelihood])
+    for metric_name, metric_mean in metrics.items():
+        print(metric_name, metric_mean)
+        with open('likelihood', 'a') as file_handle:
+            file_handle.write("{}:{}\n".format(metric_name, metric_mean))
 def eval(gpu, args):
     print('gpu{}: Begin to evaluate'.format(gpu))
     # distributed training initialization
@@ -238,18 +246,18 @@ def eval(gpu, args):
     future_coords_offsets_pd = []
     timestamps = []
     agent_ids = []
-    i = 0
+    # i = 0
     print("len", len(eval_dataloader))
     progress_bar = tqdm(eval_dataloader)
     for data in progress_bar:
-        if i > 99:
-            break
+        # if i > 99:
+        #     break
         _, ouputs = forward(data, model, gpu, criterion)
         future_coords_offsets_pd.append(ouputs.cpu().numpy().copy())
         timestamps.append(data["timestamp"].numpy().copy())
         agent_ids.append(data["track_id"].numpy().copy())
-        i = i+1
-    pred_path = "./evaluation_pred.csv"
+        # i = i+1
+    pred_path = "./evaluation_pred_full.csv"
 
     write_pred_csv(pred_path,
                    timestamps=np.concatenate(timestamps),
@@ -368,7 +376,7 @@ def main():
     args = parser.parse_args()
 
     args.world_size = args.gpus * args.nodes
-    # eval_dataset()
+
     if not cfg["train_params"]["load_the_state"]:
         mp.spawn(train, nprocs=args.gpus, args=(args,))
     if cfg["test_params"]["load_the_state"]:
@@ -379,14 +387,12 @@ def main():
         args.gpus = 1
         args.world_size = 1
         mp.spawn(eval, nprocs=args.gpus, args=(args,))
-    eval_base_path = os.environ["L5KIT_DATA_FOLDER"] + "/scenes/validate_chopped_100"
-    eval_gt_path = str(Path(eval_base_path) / "gd2000new.csv")
-    pred_path = "./evaluation_pred.csv"
-    metrics = compute_metrics_csv(eval_gt_path, pred_path, [neg_multi_log_likelihood])
-    for metric_name, metric_mean in metrics.items():
-        print(metric_name, metric_mean)
-        with open('likelihood', 'a') as file_handle:
-            file_handle.write("{}:{}\n".format(metric_name, metric_mean))
+    if False:
+        eval_dataset()
+    if False:
+        eval_csv(predcsv="./evaluation_pred.csv", evalcsv="gd2000new.csv")
+
+
 
 
 

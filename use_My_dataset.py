@@ -1,36 +1,27 @@
 from l5kit.data import ChunkedDataset, LocalDataManager
 from l5kit.rasterization import build_rasterizer
 from l5kit.configs import load_config_data
-from l5kit.dataset import AgentDataset
 import os
-from MyDataset import MyDataset
-from torch.utils.data import DataLoader
-import torch
-import torch.multiprocessing as mp
-import torch.distributed as dist
+import numpy as np
+from HandwriteDataset import HandwriteDataset
+from l5kit.dataset import EgoDataset, AgentDataset
 
-
-os.environ["L5KIT_DATA_FOLDER"] = "../input/lyft-motion-prediction-autonomous-vehicles"
+np.set_printoptions(threshold=np.inf)
+os.environ["L5KIT_DATA_FOLDER"] = '../input/lyft-motion-prediction-autonomous-vehicles'
 cfg = load_config_data('./config/l5kit_config.yaml')
-dm = LocalDataManager(None)
-train_cfg = cfg["train_data_loader"]
-dataset_path = dm.require(train_cfg["key"])
+dm = LocalDataManager()
+dataset_path = dm.require(cfg["train_data_loader"]["key"])
 zarr_dataset = ChunkedDataset(dataset_path)
 zarr_dataset.open()
-
+agents = zarr_dataset.agents
+'''
+mask_and_track_id = np.load("./data/mask&track_id.npz")
+mask = np.load(os.environ["L5KIT_DATA_FOLDER"] + '/scenes/mask.npz')
+agents_mask = mask_and_track_id["agents_mask"]
+agents_track_id_in_frames = mask_and_track_id["agents_track_id"]
+mask_agent = mask['arr_0']
+'''
 rast = build_rasterizer(cfg, dm)
-my_dataset = MyDataset(cfg, zarr_dataset, rast)
-agent_dataset = AgentDataset(cfg, zarr_dataset, rast)
-
-my_dataloader = DataLoader(my_dataset, batch_size=1, shuffle=False, num_workers=0)
-agent_dataloader = DataLoader(agent_dataset, batch_size=1, shuffle=False, num_workers=0)
-
-
-
-data = my_dataset[1024]
-print(data["neighbor_agents_history_position"])
-print(data["neighbor_agents_history_position"].shape)
-print(data["My_agent_history_position"])
-print(data["My_agent_history_position"].shape)
-print(data["neighbor_agents_track_id"])
-print(data["My_agent_track_id"])
+dataset = HandwriteDataset(cfg,zarr_dataset,rast,"./data/mask&track_id.npz")
+data = dataset[1000]
+print(data["select_track_id"])

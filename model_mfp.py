@@ -30,7 +30,6 @@ class mfpNet(nn.Module, ABC):
         self.bi_direc = args['bi_direc']  # bidirectional
         self.use_context = args['use_context']  # use contextual image as additional input
         self.modes = args['modes']  # how many latent modes
-        self.use_forcing = args['use_forcing']  # 0: Teacher forcing. 1:classmates forcing.
 
         self.hidden_fac = 2 if args['use_gru'] else 1
         self.bi_direc_fac = 2 if args['bi_direc'] else 1
@@ -158,7 +157,7 @@ class mfpNet(nn.Module, ABC):
             torch.nn.Linear(self.sec_hidden_dim, self.st_enc_pos_size)
         )
 
-    def rbf_state_enc_get_attens(self, nbrs_enc: torch.Tensor, ref_pos: torch.Tensor, nbrs_pos: torch.Tensor, nbrs_info_this: List) -> List[torch.Tensor]:
+    def rbf_state_enc_get_attens(self, nbrs_enc: torch.Tensor, ref_pos: torch.Tensor, nbrs_info_this: List) -> List[torch.Tensor]:
         """Computing the attention over other agents.
         Args:
             nbrs_enc is hidden states of every agents
@@ -176,7 +175,7 @@ class mfpNet(nn.Module, ABC):
             counter = 0
             for n in range(len(nbrs_info_this)):
                 for nbr in nbrs_info_this[n]:
-                    pos_enc[counter, :] = nbrs_pos[nbr[0], :] - ref_pos[n, :]
+                    pos_enc[counter, :] = ref_pos[nbr, :] - ref_pos[n, :]
                     counter += 1
             # size of Key is (nbrs_enc.shape[0], 8), every agents have corresponding keys
             Key = self.sec_key_net(torch.cat((nbrs_enc, pos_enc), dim=1))
@@ -268,8 +267,6 @@ class mfpNet(nn.Module, ABC):
           fut_pred: a list of predictions, one for each mode.
           modes_pred: prediction over latent modes.
         """
-        use_forcing = self.use_forcing if use_forcing is None else use_forcing
-
         # Normalize to reference position.
         # we use last frame as anchor, and calculate relative coordinate
         # ref_pos is [num_agents, 2], hist is [seq_len, num_agents, 2]
@@ -323,7 +320,7 @@ class mfpNet(nn.Module, ABC):
             # which means each agent is related to a set of neighbors, the index is the value of nbr_info[0]
             # and each neighbor is also a agent in agent_enc and ref_pos
             # attens is a list with num_agents items, each item means num_key * num_cor_nbrs
-            attens = self.rbf_state_enc_get_attens(nbrs_enc, ref_pos, nbrs_ref_pos, nbrs_info[0])
+            attens = self.rbf_state_enc_get_attens(nbrs_enc, ref_pos, nbrs_info[0])
             # nbr_atten_enc is [num_agents, 80] which combines information of all the neighbors
             nbr_atten_enc = self.rbf_state_enc_hist_fwd(attens, nbrs_enc, nbrs_info[0])
 
@@ -347,11 +344,11 @@ class mfpNet(nn.Module, ABC):
         # Use nbr_atten_enc, nbr_atten_enc and context_enc to generate probability using a Linear layer and softmax function
         modes_pred = None if self.modes == 1 else self.softmax(self.op_modes(enc))
         # call decoder function to achieve future prediction
-        fut_pred = self.decode(enc, attens, nbrs_info[0], ref_pos, fut, bStepByStep, use_forcing)
+        fut_pred = self.decode(enc, attens, nbrs_info[0], ref_pos, fut, masks, bStepByStep, use_forcing)
         return fut_pred, modes_pred
 
     def decode(self, enc: torch.Tensor, attens: List, nbrs_info_this: List, ref_pos: torch.Tensor, fut: torch.Tensor,
-               bStepByStep: bool, use_forcing: Any) -> List[torch.Tensor]:
+               mask: torch.Tensor, bStepByStep: bool, use_forcing: Any) -> List[torch.Tensor]:
         """Decode the future trajectory using RNNs.
     
         Given computed feature vector, decode the future with multimodes, using
@@ -362,6 +359,7 @@ class mfpNet(nn.Module, ABC):
           nbrs_info_this: information on who are the neighbors
           ref_pos: the current position (reference position) of the agents.
           fut: future trajectory (only useful for teacher or classmate forcing)
+          mask: future trajectory mask
           bStepByStep: interactive or non-interactive rollout
           use_forcing: 0: None. 1: Teacher-forcing. 2: classmate forcing.
 
@@ -401,7 +399,7 @@ class mfpNet(nn.Module, ABC):
                 chunks.append(len(nbrs_info_this[n]))
                 for nbr in nbrs_info_this[n]:
                     # inds reserve index of all the neighbors which can be split by chunks
-                    inds.append(nbr[0])
+                    inds.append(nbr)
             flat_index = torch.LongTensor(inds).to(ref_pos.device)
 
             fut_preds = []
@@ -416,7 +414,7 @@ class mfpNet(nn.Module, ABC):
                     # fut contains ground truth of future trajectory used to train LSTM units
                     if t == 0:  # Initial time step
                         if use_forcing == 0:    # no forcing
-                            pred_fut_t = torch.zeros_like(fut[t, :, :])
+                            pred_fut_t = torch.zeros_like(ref_pos)
                             ego_fut_t = pred_fut_t
                         elif use_forcing == 1:  # teacher forcing
                             pred_fut_t = fut[t, :, :]
@@ -426,9 +424,16 @@ class mfpNet(nn.Module, ABC):
                             ego_fut_t = torch.zeros_like(pred_fut_t)
                     else:
                         # pred_fut_t is used to encode, ego_fut_t is ground truth
+                        current_pred = preds[-1][:, :, :2].squeeze()
+                        current_gt = fut[t, :, :]
+                        current_mask = mask[t, :, :]
+                        # filter out invalid ground truth according to the mask
+                        for agents in range(current_mask.shape[0]):
+                            if current_mask[agents, 0] == 0:
+                                current_gt[agents, :] = current_pred[agents, :]
                         if use_forcing == 0:
                             # both neighbor and ego is from prediction
-                            pred_fut_t = preds[-1][:, :, :2].squeeze()
+                            pred_fut_t = current_pred
                             ego_fut_t = pred_fut_t
                         elif use_forcing == 1:
                             # both neighbor and ego is from ground truth
@@ -437,7 +442,7 @@ class mfpNet(nn.Module, ABC):
                         else:
                             # neighbor is from ground truth, ego is from prediction
                             pred_fut_t = fut[t, :, :]
-                            ego_fut_t = preds[-1][:, :, :2]
+                            ego_fut_t = current_pred
 
                     if attens is None:
                         pos_enc = torch.zeros(batch_sz, self.posi_enc_dim, device=enc.device)

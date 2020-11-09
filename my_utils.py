@@ -22,88 +22,6 @@ def Gaussian2d(x: torch.Tensor) -> torch.Tensor:
     return torch.stack([x_mean, y_mean, sigma_x, sigma_y, rho], dim=2)
 
 
-def nll_loss(pred: torch.Tensor, data: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """NLL averages across steps, samples, and dimensions(x,y)"""
-    x_mean = pred[:, :, 0]
-    y_mean = pred[:, :, 1]
-    x_sigma = pred[:, :, 2]
-    y_sigma = pred[:, :, 3]
-    rho = pred[:, :, 4]
-    ohr = torch.pow(1 - torch.pow(rho, 2), -0.5)
-    x = data[:, :, 0]
-    y = data[:, :, 1]
-    results = torch.pow(ohr, 2) * (
-            torch.pow(x_sigma, 2) * torch.pow(x - x_mean, 2) + torch.pow(y_sigma, 2) * torch.pow(y - y_mean, 2)
-            - 2 * rho * torch.pow(x_sigma, 1) * torch.pow(y_sigma, 1) * (x - x_mean) * (y - y_mean)) - torch.log(
-        x_sigma * y_sigma * ohr)
-
-    results = results * mask[:, :, 0]
-    assert torch.sum(mask) > 0.0
-    return torch.sum(results) / torch.sum(mask[:, :, 0])
-
-
-def nll_loss_per_sample(pred: torch.Tensor, data: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """NLL averages across steps and dimensions, but not samples (agents)."""
-    x_mean = pred[:, :, 0]
-    y_mean = pred[:, :, 1]
-    x_sigma = pred[:, :, 2]
-    y_sigma = pred[:, :, 3]
-    rho = pred[:, :, 4]
-    ohr = torch.pow(1 - torch.pow(rho, 2), -0.5)  # type: ignore
-    x = data[:, :, 0]
-    y = data[:, :, 1]
-    results = torch.pow(ohr, 2) * (
-            torch.pow(x_sigma, 2) * torch.pow(x - x_mean, 2) + torch.pow(y_sigma, 2) * torch.pow(y - y_mean, 2)
-            - 2 * rho * torch.pow(x_sigma, 1) * torch.pow(y_sigma, 1) * (x - x_mean) * (y - y_mean)) - torch.log(
-        x_sigma * y_sigma * ohr)
-    results = results * mask[:, :, 0]  # nSteps by nBatch
-    return torch.sum(results, dim=0) / torch.sum(mask[:, :, 0], dim=0)
-
-
-def nll_loss_test(pred: torch.Tensor, data: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """NLL for testing cases, returns a vector over future timesteps."""
-    x_mean = pred[:, :, 0]
-    y_mean = pred[:, :, 1]
-    x_sigma = pred[:, :, 2]
-    y_sigma = pred[:, :, 3]
-    rho = pred[:, :, 4]
-    ohr = torch.pow(1 - torch.pow(rho, 2), -0.5)  # type: ignore
-    x = data[:, :, 0]
-    y = data[:, :, 1]
-    results = torch.pow(ohr, 2) * (
-            torch.pow(x_sigma, 2) * torch.pow(x - x_mean, 2) + torch.pow(y_sigma, 2) * torch.pow(y - y_mean, 2)
-            - 2 * rho * torch.pow(x_sigma, 1) * torch.pow(y_sigma, 1) * (x - x_mean) * (y - y_mean)) - torch.log(
-        x_sigma * y_sigma * ohr)
-    results = results * mask[:, :, 0]  # nSteps by nBatch
-    assert torch.sum(mask) > 0.0
-    counts = torch.sum(mask[:, :, 0], dim=1)
-    return torch.sum(results, dim=1), counts
-
-
-def mse_loss(pred: torch.Tensor, data: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Mean squared error loss."""
-    x_mean = pred[:, :, 0]
-    y_mean = pred[:, :, 1]
-    x = data[:, :, 0]
-    y = data[:, :, 1]
-    results = torch.pow(x - x_mean, 2) + torch.pow(y - y_mean, 2)
-    results = results * mask[:, :, 0]
-    return torch.sum(results) / torch.sum(mask[:, :, 0])
-
-
-def mse_loss_test(pred: torch.Tensor, data: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Mean squared error loss for test time."""
-    x_mean = pred[:, :, 0]
-    y_mean = pred[:, :, 1]
-    x = data[:, :, 0]
-    y = data[:, :, 1]
-    results = torch.pow(x - x_mean, 2) + torch.pow(y - y_mean, 2)
-    results = results * mask[:, :, 0]
-    counts = torch.sum(mask[:, :, 0], dim=1)
-    lossVal = torch.sum(results, dim=1)
-    return lossVal, counts
-
-
 def logsumexp(inputs: torch.Tensor, dim: Optional[int] = None, keepdim: Optional[bool] = False) -> torch.Tensor:
     if dim is None:
         inputs = inputs.view(-1)
@@ -115,15 +33,44 @@ def logsumexp(inputs: torch.Tensor, dim: Optional[int] = None, keepdim: Optional
     return outputs
 
 
-def nll_loss_multimodes(pred: List[torch.Tensor], data: torch.Tensor, mask: torch.Tensor, modes_pred: torch.Tensor,
-                        noise: Optional[float] = 0.0) -> float:
+def nll_loss_multimodes(pred: torch.Tensor, truth: torch.Tensor, mask: torch.Tensor, modes_pred: torch.Tensor,
+                        noise: Optional[float] = 0.0, index: Optional[np.array] = None) -> torch.Tensor:
     """NLL loss multimodes for training.
-  Args:
-    pred is a list (with N modes) of predictions
-    data is ground truth    
+    Args:
+    pred is [mode, fut_len, num_agents, 2]
+    truth is [fut_len, num_agents, 2]
+    mask is [fut_len, num_agents, 1]
+    mode_pred is [num_agents, mode]
     noise is optional
-  """
+    index denote which agent is to be calculated
+    """
+    # add modes
+    truth = torch.unsqueeze(truth, 0)
+    mask = torch.unsqueeze(mask, 0)
+    # if index is not None, then extract corresponding agents
+    if index is not None:
+        pred_list = []
+        mode_list = []
+        for item in index:
+            pred_list.append(pred[:, :, item:item+1, :])
+            mode_list.append(modes_pred[item:item+1, :])
+        pred = torch.cat(pred_list, dim=2)
+        modes_pred = torch.cat(mode_list, dim=0)
 
+    # reduce coordinate and use mask, error is [mode, fut_len, num_agents]
+    error = torch.sum(((truth - pred) * mask) ** 2, dim=-1)
+    # when confidence is 0 log goes to -inf, but we're fine with it
+    # error is [mode, num_agents]
+    error = torch.log(modes_pred + 1e-6).permute(1, 0) - 0.5 * torch.sum(error, dim=-2)
+    # use max aggregator on modes for numerical stability
+    max_value = torch.max(error, dim=0, keepdim=True).values
+    # reduce modes
+    error = -torch.log(torch.sum(torch.exp(error - max_value), dim=0)) - max_value[0]
+    # return average of all the agents
+    if index is None:
+        loss = torch.mean(error)
+    else:
+        loss = torch.sum(error)
     return loss
 
 

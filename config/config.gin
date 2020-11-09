@@ -13,7 +13,7 @@ Params.input_embedding_size     = 32
 Params.dec_nbr_enc_size         = 8
 Params.nbr_atten_embedding_size = 80
 
-Params.seed                     = 1234
+Params.seed                     = 1000
 
 Params.remove_y_mean            = True                      # remove the mean of the future trajectory
 Params.use_gru                  = True                      # GRU or LSTM
@@ -22,16 +22,17 @@ Params.self_norm                = True                      # Normalize predicti
 Params.data_aug                 = False                     # Add noise to data?
 Params.use_context              = False                     # use contextual bird's eye view map?
 Params.nll                      = True                      # Use negative Log-likelihood loss
-Params.use_forcing              = 0                         # 0: no forcing. 1: teacher-forcing. 2: classmates-forcing.
+Params.use_forcing              = 1                         # 0: no forcing. 1: teacher-forcing. 2: classmates-forcing.
 
 Params.iter_per_err             = 100
-Params.iter_per_eval            = 1000
+Params.iter_per_eval            = 5000
 Params.iters_per_save           = 5000
-Params.pre_train_num_updates    = 200000
-Params.updates_div_by_10        = 100000
+Params.training_mode_update     = 20000                     # switch training forcing
+Params.pre_train_num_updates    = 50000
+Params.updates_div_by_10        = 50000
 Params.nbr_search_depth         = 10                        # depth of searching for finding 'neighbors' (only for NGSIM dataset)
 
-Params.lr_init                  = 0.001                     # initial learning rate
+Params.lr_init                  = 0.0005                     # initial learning rate
 Params.min_lr                   = 0.00005                   # minimum learning rate
 
 Params.l5kit                    = './config/l5kit_config.yaml'

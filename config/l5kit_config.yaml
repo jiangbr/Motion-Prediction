@@ -42,17 +42,20 @@ raster_params:
 ## Data loader options
 train_data_loader:
   key: "scenes/train.zarr"
+  prior_info: "./data/train_mask.npz"
+  model: "./checkpts/2020.11.08_19.58.05/checkpoints/ngsim_049999.pth"
+  cuda: 2
   shuffle: True
 
 val_data_loader:
-  key: "scenes/validate.zarr"
-  batch_size: 20
+  key: "scenes/validate_chopped_100/validate.zarr"
+  mask: "./data/validate_mask.npz"
+  gt: "scenes/validate_chopped_100/gt.csv"
   shuffle: False
-  num_workers: 0
 
 test_data_loader:
   key: "scenes/test.zarr"
-  batch_size: 20
+  mask: "./data/test_mask.npz"
+  model: "./checkpts/2020.11.08_19.58.05/checkpoints/ngsim_049999.pth"
+  cuda: 2
   shuffle: False
-  num_workers: 0
-  mask: "/scenes/mask.npz"
