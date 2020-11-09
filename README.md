@@ -1,6 +1,15 @@
-# Motion-Prediction
-Code of Kaggle Competition "Lyft Motion Prediction for Autonomous Vehicles"
+# Developing Branch
 
-File agent_motion_prediction.py is a simple example with ResNet-50
+train_cmd.py: Main function
 
-This is dev branch
+train.py: Training and evaluating function
+
+model_mfp.py: Model of "Multiple Future Prediction"
+
+my_utils.py: Utility functions
+
+MyDataset.py, My_agent_sampling.py: Dataset function
+
+HandwriteDataset: New dataset function
+
+

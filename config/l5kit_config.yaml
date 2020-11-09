@@ -1,11 +1,6 @@
-# Config format schema number
-format_version: 4
-
 ###################
 ## Model options
 model_params:
-  model_architecture: "resnet50"
-
   history_num_frames: 99
   history_step_size: 1
   history_delta_time: 0.1
@@ -47,40 +42,20 @@ raster_params:
 ## Data loader options
 train_data_loader:
   key: "scenes/train.zarr"
-  batch_size: 20
-  shuffle: False
-  num_workers: 8
+  prior_info: "./data/train_mask.npz"
+  model: "./checkpts/2020.11.09_09.44.31/checkpoints/ngsim_009999.pth"
+  cuda: 2
+  shuffle: True
 
 val_data_loader:
-  key: "scenes/validate.zarr"
-  batch_size: 20
+  key: "scenes/validate_chopped_100/validate.zarr"
+  mask: "./data/validate_mask.npz"
+  gt: "scenes/validate_chopped_100/gt.csv"
   shuffle: False
-  num_workers: 0
-  mask: "/scenes/mask.npz"
+
 test_data_loader:
   key: "scenes/test.zarr"
-  batch_size: 40
+  mask: "./data/test_mask.npz"
+  model: "./checkpts/2020.11.09_09.44.31/checkpoints/ngsim_009999.pth"
+  cuda: 2
   shuffle: False
-  num_workers: 2
-  mask: "/scenes/mask.npz"
-
-###################
-## Train params
-train_params:
-  checkpoint_every_n_steps: 4000
-  max_num_epochs: 4
-  eval_every_n_steps: 10000
-  load_the_state: True
-  model_num: 0
-val_params:
-  checkpoint_every_n_steps: 4000
-  max_num_epochs: 4
-  eval_every_n_steps: 10000
-  load_the_state: True
-  model_num: 12000
-test_params:
-  checkpoint_every_n_steps: 4000
-  max_num_epochs: 4
-  eval_every_n_steps: 10000
-  load_the_state: False
-  model_num: 12000
