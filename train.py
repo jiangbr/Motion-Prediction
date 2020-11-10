@@ -269,6 +269,9 @@ def train(rank: int, args: Any) -> None:
     # wrap dataset with StampDataset
     train_dataset = StampDataset(hand_dataset)
 
+    hand_data = hand_dataset[999]
+    train_data = train_dataset[999]
+
     # wrap the dataset
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=args.gpus,
                                                                     rank=rank, shuffle=train_cfg["shuffle"])
