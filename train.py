@@ -117,6 +117,7 @@ class StampDataset(Dataset):
         hist = []
         fut = []
         masks = []
+        hist_masks = []
         new_index = []
         # define minimum history and future trajectory
         min_hist = 50
@@ -143,9 +144,14 @@ class StampDataset(Dataset):
                         mask = np.zeros([fut_origin.shape[1], 1])
                         mask[0:int(status[i, 1]), :] = 1
                         masks.append(mask)
+                        # define history mask
+                        hist_mask = np.zeros([hist_origin.shape[1], 1])
+                        hist_mask[-int(status[i, 0]):, :] = 1
+                        hist_masks.append(hist_mask)
         hist = np.stack(hist, axis=1)
         fut = np.stack(fut, axis=1)
         masks = np.stack(masks, axis=1)
+        hist_masks = np.stack(hist_masks, axis=1)
         new_index = np.array(new_index)
         assert new_index.shape[0] == target_index.shape[0], 'index not matching'
 
@@ -157,6 +163,9 @@ class StampDataset(Dataset):
             # define neighbors to be all the rest agents
             nbrs = [np.delete(hist, i, axis=1) for i in range(hist.shape[1])]
             nbrs = np.concatenate(nbrs, axis=1)
+            # define masks
+            nbrs_mask = [np.delete(hist_masks, i, axis=1) for i in range(hist_masks.shape[1])]
+            nbrs_mask = np.concatenate(nbrs_mask, axis=1)
 
             # define nbrs_info
             index_list = np.array(range(hist.shape[1]))
@@ -166,11 +175,13 @@ class StampDataset(Dataset):
             # limit neighbors in an certain region
             ref_pos = hist[-1, :, :]
             nbrs = []
+            nbrs_mask = []
             neighbor_list = []
             # search neighbors for all the agents
             for i in range(hist.shape[1]):
                 # define candidate neighbors
                 candidate = np.delete(hist, i, axis=1)
+                candidate_mask = np.delete(hist_masks, i, axis=1)
                 candidate_index = np.delete(np.array(range(hist.shape[1])), i)
                 # calculate distance
                 distance = candidate[-1, :, :] - ref_pos[i:i + 1, :]
@@ -179,16 +190,21 @@ class StampDataset(Dataset):
                 # we choose threshold to be 50
                 nbrs_temp = []
                 list_temp = []
+                mask_temp = []
                 for j, data in enumerate(distance):
                     if data <= aver_distance:
                         nbrs_temp.append(candidate[:, j:j + 1, :])
+                        mask_temp.append(candidate_mask[:, j:j + 1, :])
                         list_temp.append(candidate_index[j])
                 nbrs_temp = np.concatenate(nbrs_temp, axis=1)
+                mask_temp = np.concatenate(mask_temp, axis=1)
                 list_temp = np.array(list_temp)
                 nbrs.append(nbrs_temp)
+                nbrs_mask.append(mask_temp)
                 neighbor_list.append(list_temp)
             # define nbrs and nbrs_info
             nbrs = np.concatenate(nbrs, axis=1)
+            nbrs_mask = np.concatenate(nbrs_mask, axis=1)
             nbrs_info = [{i: nbr for i, nbr in enumerate(neighbor_list)}]
 
         # define future trajectory for exact agents
@@ -206,7 +222,7 @@ class StampDataset(Dataset):
             # define fut
             fut = np.concatenate([x_axis, y_axis], axis=2)
         # combine to be a tuple
-        item = (hist, nbrs, fut, masks, context, nbrs_info, new_index)
+        item = (hist, nbrs, fut, masks, hist_masks, nbrs_mask, context, nbrs_info, new_index)
 
         '''
         if nbrs.shape[1] > self.max_len:
@@ -218,16 +234,18 @@ class StampDataset(Dataset):
     @staticmethod
     def collate_fn(samples: List[Any]) -> Tuple:
         """Return desired format for DataLoader"""
-        hist, nbrs, fut, mask, context, nbrs_info, index = samples[0]
+        hist, nbrs, fut, mask, hist_mask, nbrs_mask, context, nbrs_info, index = samples[0]
         # transform to tensor
         hist = torch.from_numpy(hist).float()
         nbrs = torch.from_numpy(nbrs).float()
         fut = torch.from_numpy(fut).float()
-        mask = torch.from_numpy(mask)
+        mask = torch.from_numpy(mask).float()
+        hist_mask = torch.from_numpy(hist_mask).float()
+        nbrs_mask = torch.from_numpy(nbrs_mask).float()
         if context is not None:
-            context = torch.from_numpy(context)
+            context = torch.from_numpy(context).float()
 
-        return hist, nbrs, fut, mask, context, nbrs_info, index
+        return hist, nbrs, fut, mask, hist_mask, nbrs_mask, context, nbrs_info, index
 
 
 #####################################################################################################
@@ -268,9 +286,6 @@ def train(rank: int, args: Any) -> None:
 
     # wrap dataset with StampDataset
     train_dataset = StampDataset(hand_dataset)
-
-    hand_data = hand_dataset[999]
-    train_data = train_dataset[999]
 
     # wrap the dataset
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=args.gpus,
@@ -365,17 +380,19 @@ def train(rank: int, args: Any) -> None:
             # mask is [fut_len, num_agents, 1]
             # context is [num_agents, 3, 96, 320]
             # nbrs_info[0] is dictionary with {0: nbrs, 1:nbrs}
-            hist, nbrs, fut, mask, context, nbrs_info, index = data
+            hist, nbrs, fut, mask, hist_mask, nbrs_mask, context, nbrs_info, index = data
             hist = hist.cuda(gpu)
             nbrs = nbrs.cuda(gpu)
             fut = fut.cuda(gpu)
             mask = mask.cuda(gpu)
+            hist_mask = hist_mask.cuda(gpu)
+            nbrs_mask = nbrs_mask.cuda(gpu)
             if context is not None:
                 context = context.cuda(gpu)
 
             # Forward pass.
-            fut_preds, modes_pred = net.module.forward_mfp(hist, nbrs, mask, context, nbrs_info, fut,
-                                                           bStepByStep, use_forcing=use_forcing)
+            fut_preds, modes_pred = net.module.forward_mfp(hist, nbrs, mask, hist_mask, nbrs_mask, context, nbrs_info,
+                                                           fut, bStepByStep, use_forcing=use_forcing)
             # transform predict to [modes, fut_len, num_agents, 2]
             fut_preds = torch.stack(fut_preds, 0)[:, :, :, :2]
 
@@ -439,18 +456,20 @@ def evaluate(net: torch.nn.Module, params: AttrDict, data_loader: DataLoader, bS
             # iter for certain times
             if i >= num_batches:
                 break
-            hist, nbrs, fut, mask, context, nbrs_info, index = data
+            hist, nbrs, fut, mask, hist_mask, nbrs_mask, context, nbrs_info, index = data
             if params.use_cuda:
                 hist = hist.cuda()
                 nbrs = nbrs.cuda()
                 fut = fut.cuda()
                 mask = mask.cuda()
+                hist_mask = hist_mask.cuda()
+                nbrs_mask = nbrs_mask.cuda()
                 if context is not None:
                     context = context.cuda()
 
             # Forward pass
-            fut_preds, modes_pred = net.module.forward_mfp(hist, nbrs, mask, context, nbrs_info, fut, bStepByStep,
-                                                           use_forcing=use_forcing)
+            fut_preds, modes_pred = net.module.forward_mfp(hist, nbrs, mask, hist_mask, nbrs_mask, context, nbrs_info,
+                                                           fut, bStepByStep, use_forcing=use_forcing)
             # transform predict to [modes, fut_len, num_agents, 2]
             fut_preds = torch.stack(fut_preds, 0)[:, :, :, :2]
 
