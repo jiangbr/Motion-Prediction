@@ -13,7 +13,7 @@ from train import train, test
 def main() -> None:
     # define parser
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpus', '-g', type=int, default=6)
+    parser.add_argument('--gpus', '-g', type=int, default=1)
     parser.add_argument('--list', '-l', type=list, default=[2, 3, 4, 5, 6, 7])
     parser.add_argument('--config', '-c', type=str, default='./config/config.gin')
     parser.add_argument('--mode', '-m', type=str, default='train', help='train, test or validate')

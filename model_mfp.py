@@ -246,8 +246,8 @@ class mfpNet(nn.Module, ABC):
         pos_enc = torch.stack(out, dim=0).view(len(attens), -1)  # num_agents by slots*enc dim
         return self.sec_pos_net(pos_enc)
 
-    def forward_mfp(self, hist: torch.Tensor, nbrs: torch.Tensor, masks: torch.Tensor, context: Any,
-                    nbrs_info: List, fut: torch.Tensor, bStepByStep: bool,
+    def forward_mfp(self, hist: torch.Tensor, nbrs: torch.Tensor, masks: torch.Tensor, hist_masks: torch.Tensor,
+                    nbrs_masks: torch.Tensor, context: Any, nbrs_info: List, fut: torch.Tensor, bStepByStep: bool,
                     use_forcing: Optional[Union[None, int]] = None) -> Tuple[List[torch.Tensor], Any]:
         """Forward propagation function for the MFP
     
@@ -257,6 +257,8 @@ class mfpNet(nn.Module, ABC):
           hist: Trajectory history.
           nbrs: Neighbors.
           masks: Neighbors mask.
+          hist_masks: history trajectory mask
+          nbrs_masks: neighbor history trajectory mask
           context: contextual information in image form (if used).
           nbrs_info: information as to which other agents are neighbors.
           fut: Future Trajectory.
@@ -272,6 +274,7 @@ class mfpNet(nn.Module, ABC):
         # ref_pos is [num_agents, 2], hist is [seq_len, num_agents, 2]
         ref_pos = hist[-1, :, :]
         hist = hist - ref_pos.view(1, -1, 2)
+        hist = hist * hist_masks
 
         # Encode history trajectories.
         if isinstance(self.enc_lstm, torch.nn.modules.rnn.GRU):
@@ -300,6 +303,7 @@ class mfpNet(nn.Module, ABC):
             # nbrs can be divided into num_agents parts which are the corresponding neighbors of agents
             nbrs_ref_pos = nbrs[-1, :, :]
             nbrs = nbrs - nbrs_ref_pos.view(1, -1, 2)
+            nbrs = nbrs * nbrs_masks
 
             # Forward pass for all neighbors.
             if isinstance(self.enc_lstm, torch.nn.modules.rnn.GRU):
